@@ -2,6 +2,28 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [1.0.7] - 2026-03-04
+
+### Added
+- 新增 JSON 响应降级处理：当内置供应商返回非 JSON 格式时，自动提取纯文本和 URL 作为来源，不再直接报错
+- 新增 `_try_parse_json_response()` 方法：支持解析多种格式（纯 JSON、Markdown 代码块、混合文本中的嵌套 JSON）
+- 新增 `_extract_sources_from_text()` 方法：从非 JSON 文本中提取 URL 作为来源
+
+### Changed
+- `/grok` 指令提示词改为英文指令 + JSON 格式 + 中文回复要求（专有名词保留原文）
+- LLM Tool 和 Skill 提示词保持英文 + JSON 格式（无语言要求）
+- JSON 解析改用 `json.JSONDecoder().raw_decode` 支持嵌套结构，避免正则截断问题
+
+### Fixed
+- 修复混合文本中嵌套 JSON 解析失败的问题
+- 修复内置供应商返回非 JSON 时用户看到"获取到非 JSON 文本"错误的问题
+
+### Security
+- URL 协议白名单校验：仅允许 `http`/`https`，拒绝 `javascript:`、`data:`、`file:` 等协议
+- URL 长度限制：最大 2048 字符
+- URL 控制字符过滤：拒绝包含 ASCII 控制字符的 URL
+- 错误响应检测：识别 rate limit、unauthorized 等错误模式，避免将错误文案误判为成功
+
 ## [1.0.6] - 2026-02-21
 
 ### Added

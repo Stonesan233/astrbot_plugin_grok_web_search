@@ -9,6 +9,7 @@ AstrBot 插件：Grok 联网搜索
 
 import shutil
 from pathlib import Path
+import re
 
 import aiohttp
 import asyncio
@@ -333,29 +334,20 @@ class GrokSearchPlugin(Star):
                     )
 
                     text = llm_resp.completion_text or ""
-                    try:
-                        parsed = json.loads(text)
+                    usage = {}
+                    if llm_resp.usage:
+                        usage = {
+                            "prompt_tokens": llm_resp.usage.input,
+                            "completion_tokens": llm_resp.usage.output,
+                            "total_tokens": llm_resp.usage.total,
+                        }
+
+                    # 尝试解析 JSON 格式响应
+                    parsed = self._try_parse_json_response(text)
+                    if parsed is not None:
                         content = str(parsed.get("content", ""))
                         raw_sources = parsed.get("sources", [])
-                        # 归一化 sources 结构
-                        sources = []
-                        if isinstance(raw_sources, list):
-                            for item in raw_sources:
-                                if isinstance(item, dict) and item.get("url"):
-                                    sources.append(
-                                        {
-                                            "url": str(item.get("url")),
-                                            "title": str(item.get("title") or ""),
-                                            "snippet": str(item.get("snippet") or ""),
-                                        }
-                                    )
-                        usage = {}
-                        if llm_resp.usage:
-                            usage = {
-                                "prompt_tokens": llm_resp.usage.input,
-                                "completion_tokens": llm_resp.usage.output,
-                                "total_tokens": llm_resp.usage.total,
-                            }
+                        sources = self._normalize_sources(raw_sources)
                         return {
                             "ok": True,
                             "content": content,
@@ -363,14 +355,57 @@ class GrokSearchPlugin(Star):
                             "elapsed_ms": int((time.time() - started) * 1000),
                             "retries": attempts,
                             "usage": usage,
-                            "raw": text,
+                            "raw": "",
                         }
-                    except Exception:
+
+                    # JSON 解析失败，降级处理：提取纯文本和 URL
+                    logger.warning(
+                        f"[{PLUGIN_NAME}] 内置供应商返回非 JSON 格式，使用降级处理"
+                    )
+
+                    # 检测典型错误模式，避免将错误文案误判为成功
+                    text_lower = text.lower()
+                    error_patterns = [
+                        "rate limit",
+                        "too many requests",
+                        "quota exceeded",
+                        "authentication failed",
+                        "invalid api key",
+                        "unauthorized",
+                        "service unavailable",
+                        "internal server error",
+                        "timeout",
+                        "connection refused",
+                    ]
+                    is_error_response = any(p in text_lower for p in error_patterns)
+
+                    if not text.strip() or is_error_response:
+                        error_msg = (
+                            "提供商返回空响应"
+                            if not text.strip()
+                            else f"提供商返回错误: {text[:200]}"
+                        )
                         return {
                             "ok": False,
-                            "error": "提供商返回内容不是有效的 JSON",
-                            "raw": text,
+                            "error": error_msg,
+                            "content": "",
+                            "sources": [],
+                            "elapsed_ms": int((time.time() - started) * 1000),
+                            "retries": attempts,
+                            "usage": usage,
+                            "raw": text[:500] if text else "",
                         }
+
+                    sources = self._extract_sources_from_text(text)
+                    return {
+                        "ok": True,
+                        "content": text,
+                        "sources": sources,
+                        "elapsed_ms": int((time.time() - started) * 1000),
+                        "retries": attempts,
+                        "usage": usage,
+                        "raw": text,
+                    }
 
                 except Exception as e:
                     last_exc = e
@@ -481,7 +516,124 @@ class GrokSearchPlugin(Star):
                 if snippet:
                     lines.append(f"     {snippet}")
 
+        # 提示主 LLM 使用纯文本格式回复用户
+        lines.append("\n[提示: 请使用纯文本格式回复用户，不要使用 Markdown 格式]")
+
         return "\n".join(lines)
+
+    def _try_parse_json_response(self, text: str) -> dict | None:
+        """尝试解析 JSON 响应，支持多种格式
+
+        支持的格式：
+        1. 纯 JSON 对象
+        2. Markdown 代码块包裹的 JSON
+        3. 混合文本中的 JSON（支持嵌套结构）
+        """
+
+        if not text or not text.strip():
+            return None
+
+        text = text.strip()
+
+        # 尝试直接解析
+        if text.startswith("{") and text.endswith("}"):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+
+        # 尝试提取 Markdown 代码块中的 JSON
+        code_block_pattern = r"```(?:json)?\s*\n?([\s\S]*?)\n?```"
+        matches = re.findall(code_block_pattern, text)
+        for match in matches:
+            try:
+                parsed = json.loads(match.strip())
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                continue
+
+        # 使用 JSONDecoder.raw_decode 从每个 { 起点尝试解码（支持嵌套结构）
+        decoder = json.JSONDecoder()
+        start_idx = 0
+        max_attempts = 10  # 限制尝试次数
+
+        while start_idx < len(text) and max_attempts > 0:
+            brace_pos = text.find("{", start_idx)
+            if brace_pos == -1:
+                break
+
+            try:
+                parsed, end_idx = decoder.raw_decode(text, idx=brace_pos)
+                if isinstance(parsed, dict) and (
+                    "content" in parsed or "sources" in parsed
+                ):
+                    return parsed
+                start_idx = end_idx
+            except json.JSONDecodeError:
+                start_idx = brace_pos + 1
+
+            max_attempts -= 1
+
+        return None
+
+    def _normalize_sources(self, raw_sources: list) -> list[dict[str, str]]:
+        """归一化 sources 结构，仅允许 http/https 协议"""
+        from urllib.parse import urlparse
+
+        sources = []
+        if isinstance(raw_sources, list):
+            for item in raw_sources:
+                if isinstance(item, dict) and item.get("url"):
+                    url = str(item.get("url", ""))
+                    # URL 协议白名单校验
+                    try:
+                        parsed = urlparse(url)
+                        if parsed.scheme not in ("http", "https"):
+                            continue
+                        # 限制长度和过滤控制字符
+                        if len(url) > 2048 or any(ord(c) < 32 for c in url):
+                            continue
+                    except Exception:
+                        continue
+
+                    sources.append(
+                        {
+                            "url": url,
+                            "title": str(item.get("title") or ""),
+                            "snippet": str(item.get("snippet") or ""),
+                        }
+                    )
+        return sources
+
+    def _extract_sources_from_text(self, text: str) -> list[dict[str, str]]:
+        """从文本中提取 URL 作为来源，仅允许 http/https 协议"""
+        from urllib.parse import urlparse
+
+        sources = []
+        url_pattern = r"https://[^\s)\]}>\"']+|http://[^\s)\]}>\"']+"
+        seen: set[str] = set()
+
+        for match in re.finditer(url_pattern, text):
+            url = match.group().rstrip(".,;:!?\"'")
+            if not url or url in seen:
+                continue
+            # URL 校验
+            try:
+                parsed = urlparse(url)
+                if parsed.scheme not in ("http", "https"):
+                    continue
+                if len(url) > 2048 or any(ord(c) < 32 for c in url):
+                    continue
+            except Exception:
+                continue
+
+            seen.add(url)
+            sources.append({"url": url, "title": "", "snippet": ""})
+
+        return sources
 
     def _help_text(self) -> str:
         """返回帮助文本"""
@@ -538,19 +690,18 @@ class GrokSearchPlugin(Star):
             yield event.plain_result(self._help_text())
             return
 
-        # 优先使用自定义提示词，未设置则使用内置中文提示词
+        # 优先使用自定义提示词，未设置则使用内置提示词（英文指令 + JSON 格式 + 中文回复）
         custom_prompt = self.config.get("custom_system_prompt", "")
         if custom_prompt and isinstance(custom_prompt, str) and custom_prompt.strip():
             cmd_system_prompt = custom_prompt.strip()
         else:
             cmd_system_prompt = (
-                "你是一个网络研究助手。请使用实时网络搜索/浏览来回答问题。"
-                "请务必使用中文回复。"
-                "如果有专有名词或技术术语，可以直接使用原词，或者在中文旁边加个方括号把原词写在里面，例如：人工智能[AI]。"
-                "只返回一个 JSON 对象，包含以下字段："
-                "content（字符串，综合答案），sources（数组，包含 url/title/snippet 的来源对象）。"
-                "内容要简洁且有据可依。"
-                "重要：content 字段中不要使用 Markdown 格式，只使用纯文本。"
+                "You are a web research assistant. Use live web search/browsing when answering. "
+                "Return ONLY a single JSON object with keys: "
+                "content (string), sources (array of objects with url/title/snippet when possible). "
+                "Keep content concise and evidence-backed. "
+                "IMPORTANT: Respond in Chinese. Do NOT use Markdown formatting in the content field - use plain text only. "
+                "Keep proper nouns and names in their original language."
             )
 
         result = await self._do_search(
