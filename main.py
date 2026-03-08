@@ -8,6 +8,8 @@ AstrBot 插件：Grok 联网搜索
 """
 
 import shutil
+import tempfile
+import zipfile
 from pathlib import Path
 import re
 
@@ -134,15 +136,17 @@ class GrokSearchPlugin(Star):
                 f"[{PLUGIN_NAME}] API 连通性检查超时，请检查 base_url 是否可达"
             )
 
-    def _get_skills_path(self) -> Path:
-        """获取 skills 目录路径"""
+    def _get_skill_manager(self):
+        """获取 SkillManager 实例（延迟导入）"""
+        if hasattr(self, "_skill_mgr"):
+            return self._skill_mgr
         try:
-            from astrbot.core.utils.astrbot_path import get_astrbot_skills_path
+            from astrbot.core.skills import SkillManager
 
-            return Path(get_astrbot_skills_path())
+            self._skill_mgr = SkillManager()
         except ImportError:
-            # 回退到相对路径
-            return Path(__file__).parent.parent.parent / "skills"
+            self._skill_mgr = None
+        return self._skill_mgr
 
     def _get_plugin_data_path(self) -> Path:
         """获取插件持久化数据目录"""
@@ -164,78 +168,69 @@ class GrokSearchPlugin(Star):
         return self._get_plugin_data_path() / "skill"
 
     def _migrate_skill_to_persistent(self):
-        """首次安装：将插件目录的 skill 移动到持久化目录"""
+        """首次安装：将插件目录的 skill 复制到持久化目录"""
         source_dir = Path(__file__).parent / "skill"
         persistent_dir = self._get_skill_persistent_path()
 
-        # 如果插件目录有 skill 且持久化目录没有，则移动
         if source_dir.exists() and not persistent_dir.exists():
             try:
-                shutil.move(str(source_dir), str(persistent_dir))
+                shutil.copytree(source_dir, persistent_dir, symlinks=True)
                 logger.info(
-                    f"[{PLUGIN_NAME}] Skill 已迁移到持久化目录: {persistent_dir}"
+                    f"[{PLUGIN_NAME}] Skill 已复制到持久化目录: {persistent_dir}"
                 )
             except Exception as e:
-                logger.error(f"[{PLUGIN_NAME}] Skill 迁移失败: {e}")
-                # 迁移失败则复制
-                try:
-                    shutil.copytree(source_dir, persistent_dir)
-                    logger.info(
-                        f"[{PLUGIN_NAME}] Skill 已复制到持久化目录: {persistent_dir}"
-                    )
-                except Exception as e2:
-                    logger.error(f"[{PLUGIN_NAME}] Skill 复制也失败: {e2}")
+                logger.error(f"[{PLUGIN_NAME}] Skill 复制到持久化目录失败: {e}")
 
     def _install_skill(self):
-        """从持久化目录安装 Skill 到 skills 目录"""
-        skills_path = self._get_skills_path()
-        target_dir = skills_path / "grok-search"
+        """通过 SkillManager 安装 Skill（打包为 zip 后调用官方接口）"""
         source_dir = self._get_skill_persistent_path()
 
         if not source_dir.exists():
-            logger.warning(f"[{PLUGIN_NAME}] Skill 持久化目录不存在: {source_dir}")
+            logger.error(f"[{PLUGIN_NAME}] Skill 持久化目录不存在: {source_dir}")
             return
 
-        # 安全检查：确保源目录不是 symlink
         if source_dir.is_symlink():
             logger.error(
                 f"[{PLUGIN_NAME}] Skill 源目录是 symlink，拒绝安装: {source_dir}"
             )
             return
 
-        try:
-            skills_path.mkdir(parents=True, exist_ok=True)
-            if target_dir.exists():
-                shutil.rmtree(target_dir)
-            # 使用 symlinks=True 避免跟随 symlink 复制敏感文件
-            shutil.copytree(source_dir, target_dir, symlinks=True)
-            logger.info(f"[{PLUGIN_NAME}] Skill 已安装到 {target_dir}")
-        except Exception as e:
-            logger.error(f"[{PLUGIN_NAME}] Skill 安装失败: {e}")
-
-    def _uninstall_skill(self):
-        """从 skills 目录卸载 Skill，移动回持久化目录"""
-        skills_path = self._get_skills_path()
-        source_dir = skills_path / "grok-search"
-
-        if not source_dir.exists():
+        skill_mgr = self._get_skill_manager()
+        if not skill_mgr:
+            logger.error(f"[{PLUGIN_NAME}] SkillManager 不可用，无法安装 Skill")
             return
 
-        persistent_dir = self._get_skill_persistent_path()
+        tmp_zip = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+                tmp_zip = Path(tmp.name)
+
+            with zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+                for file in source_dir.rglob("*"):
+                    if file.is_file():
+                        arcname = f"grok-search/{file.relative_to(source_dir)}"
+                        zf.write(file, arcname)
+
+            skill_mgr.install_skill_from_zip(str(tmp_zip), overwrite=True)
+            logger.info(f"[{PLUGIN_NAME}] Skill 已通过 SkillManager 安装并激活")
+        except Exception as e:
+            logger.error(f"[{PLUGIN_NAME}] Skill 安装失败: {e}")
+        finally:
+            if tmp_zip:
+                tmp_zip.unlink(missing_ok=True)
+
+    def _uninstall_skill(self):
+        """通过 SkillManager 卸载 Skill"""
+        skill_mgr = self._get_skill_manager()
+        if not skill_mgr:
+            logger.error(f"[{PLUGIN_NAME}] SkillManager 不可用，无法卸载 Skill")
+            return
 
         try:
-            # 更新持久化目录
-            if persistent_dir.exists():
-                shutil.rmtree(persistent_dir)
-            shutil.move(str(source_dir), str(persistent_dir))
-            logger.info(f"[{PLUGIN_NAME}] Skill 已移动回持久化目录: {persistent_dir}")
+            skill_mgr.delete_skill("grok-search")
+            logger.info(f"[{PLUGIN_NAME}] Skill 已通过 SkillManager 卸载")
         except Exception as e:
-            logger.error(f"[{PLUGIN_NAME}] Skill 移动失败: {e}")
-            # 移动失败则直接删除
-            try:
-                shutil.rmtree(source_dir)
-            except Exception:
-                pass
+            logger.error(f"[{PLUGIN_NAME}] Skill 卸载失败: {e}")
 
     def _parse_json_config(self, key: str) -> dict:
         """解析 JSON 格式的配置项"""

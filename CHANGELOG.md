@@ -2,6 +2,14 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [1.0.8] - 2026-03-08
+
+### Changed
+- Skill 安装改用 `SkillManager.install_skill_from_zip()` 官方接口，正式注册到 `skills.json` 配置
+- Skill 卸载改用 `SkillManager.delete_skill()` 官方接口，同步清理目录和配置
+- Skill 首次迁移从移动改为复制，插件源目录始终保留原始副本
+- 移除手动路径管理回退逻辑，统一依赖 SkillManager API
+
 ## [1.0.7] - 2026-03-04
 
 ### Added
