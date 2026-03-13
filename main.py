@@ -18,7 +18,11 @@ import time
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star
-from astrbot.core.message.components import Image, Node, Nodes, Plain, Reply
+from astrbot.core.message.components import Image
+from astrbot.core.utils.quoted_message.chain_parser import (
+    _extract_image_refs_from_component_chain,
+    _extract_text_from_component_chain,
+)
 from astrbot.core.provider.entities import ProviderRequest
 from astrbot.core.provider.func_tool_manager import FunctionToolManager
 
@@ -54,33 +58,27 @@ class GrokSearchPlugin(Star):
 
     async def _extract_content_from_event(
         self, event: AstrMessageEvent
-    ) -> tuple[list[str], list[str]]:
+    ) -> tuple[str | None, list[str]]:
         """Extract text and images from the user's message.
 
-        Handles three message patterns:
-        - Direct Image/Plain components in the message chain
-        - Content inside Reply.chain (quoted/replied messages)
-        - Content inside Node/Nodes.content (QQ forwarded messages, recursive)
+        Reuses AstrBot core's chain_parser for text/image extraction from
+        Reply, Node, Nodes, Forward, etc.
 
         Returns:
-            A tuple of (texts, images):
-            - texts: list of text strings from nested components (Reply/Node/Nodes)
+            A tuple of (text, images):
+            - text: extracted text from the message chain (or None)
             - images: list of base64-encoded image strings (without prefix)
         """
-        texts: list[str] = []
-        images: list[str] = []
-        await self._collect_content_from_chain(event.get_messages(), texts, images)
-        return texts, images
+        chain = event.get_messages()
 
-    async def _collect_content_from_chain(
-        self,
-        chain: list,
-        texts: list[str],
-        images: list[str],
-    ) -> None:
-        """Recursively collect text and images from a message component chain."""
-        if not chain:
-            return
+        # 使用本体的 chain_parser 提取文本（处理 Reply/Node/Nodes/Forward）
+        text = _extract_text_from_component_chain(chain)
+
+        # 使用本体的 chain_parser 提取图片引用，再转为 base64
+        image_refs = _extract_image_refs_from_component_chain(chain)
+        images: list[str] = []
+
+        # 提取消息链顶层的 Image 组件并转为 base64
         for comp in chain:
             if isinstance(comp, Image):
                 try:
@@ -91,22 +89,20 @@ class GrokSearchPlugin(Star):
                     logger.warning(
                         f"[{PLUGIN_NAME}] Failed to convert image to base64: {e}"
                     )
-            elif isinstance(comp, Plain):
-                if comp.text and comp.text.strip():
-                    texts.append(comp.text.strip())
-            elif isinstance(comp, Reply):
-                if comp.chain:
-                    await self._collect_content_from_chain(comp.chain, texts, images)
-            elif isinstance(comp, Node):
-                if comp.content:
-                    await self._collect_content_from_chain(comp.content, texts, images)
-            elif isinstance(comp, Nodes):
-                if comp.nodes:
-                    for node in comp.nodes:
-                        if node.content:
-                            await self._collect_content_from_chain(
-                                node.content, texts, images
-                            )
+
+        # 将嵌套组件中的图片引用（URL/路径）转为 base64
+        for ref in image_refs:
+            try:
+                img = Image.fromURL(ref)
+                b64 = await img.convert_to_base64()
+                if b64:
+                    images.append(b64)
+            except Exception as e:
+                logger.warning(
+                    f"[{PLUGIN_NAME}] Failed to convert image ref to base64: {e}"
+                )
+
+        return text, images
 
     async def initialize(self):
         """插件初始化：验证配置并处理 Skill 安装"""
@@ -385,7 +381,7 @@ class GrokSearchPlugin(Star):
 
                     provider_id = prov.meta().id
 
-                    # Build image_urls for builtin provider from base64
+                    # 将 base64 图片转为内置供应商的 image_urls 格式
                     image_urls = (
                         [f"base64://{img}" for img in images] if images else None
                     )
@@ -600,33 +596,32 @@ class GrokSearchPlugin(Star):
 
         用法: /grok <搜索内容>
         """
-        # Extract text and images from user's message first (including Reply/Node/Nodes)
-        extra_texts, images = await self._extract_content_from_event(event)
+        # 提取消息中的文本和图片（包括引用消息/转发消息）
+        extra_text, images = await self._extract_content_from_event(event)
         if images:
             logger.info(
                 f"[{PLUGIN_NAME}] /grok command: extracted {len(images)} image(s) from message"
             )
 
-        # Show help only when explicitly requested
+        # 仅在明确输入 help 时显示帮助
         if query.strip().lower() == "help":
             yield event.plain_result(self._help_text())
             return
 
-        # If no query text but has images or referenced content, use a default prompt
-        has_content = bool(images) or bool(extra_texts)
+        # 无查询文本但有图片或引用内容时，继续搜索
+        has_content = bool(images) or bool(extra_text)
         if not query.strip() and not has_content:
             yield event.plain_result(self._help_text())
             return
 
-        # Prepend extracted text context from Reply/Node/Nodes to the query
-        if extra_texts:
-            context_text = "\n".join(extra_texts)
+        # 将引用/转发消息中提取的文本拼接到查询前面作为上下文
+        if extra_text:
             if query.strip():
-                query = f"[Referenced message content]\n{context_text}\n\n[User query]\n{query}"
+                query = f"[Referenced message content]\n{extra_text}\n\n[User query]\n{query}"
             else:
-                query = context_text
+                query = extra_text
 
-        # If only images with no text at all, use a default prompt
+        # 仅有图片无文本时，使用默认提示词
         if not query.strip() and images:
             query = "请描述这张图片的内容"
 
@@ -679,10 +674,10 @@ class GrokSearchPlugin(Star):
             query(string): 搜索查询内容，应该是清晰具体的问题或关键词
             image_urls(string): 可选，逗号分隔的图片 URL 或 base64:// 链接
         """
-        # Collect images: from LLM-provided image_urls param + from user's message
+        # 收集图片：从 LLM 传入的 image_urls 参数 + 用户消息中提取
         images: list[str] = []
 
-        # 1. Parse image_urls provided by LLM
+        # 1. 解析 LLM 传入的 image_urls
         if image_urls and isinstance(image_urls, str):
             for url in image_urls.split(","):
                 url = url.strip()
@@ -691,7 +686,7 @@ class GrokSearchPlugin(Star):
                 if url.startswith("base64://"):
                     images.append(url.removeprefix("base64://"))
                 elif url.startswith("http"):
-                    # Download and convert to base64
+                    # 下载并转为 base64
                     try:
                         from astrbot.core.utils.io import download_image_by_url
                         from astrbot.core.utils.io import file_to_base64
@@ -706,15 +701,14 @@ class GrokSearchPlugin(Star):
                             f"[{PLUGIN_NAME}] Failed to download image from URL {url}: {e}"
                         )
 
-        # 2. Auto-extract content from user's message event
-        extra_texts, event_images = await self._extract_content_from_event(event)
+        # 2. 从用户消息事件中自动提取内容
+        extra_text, event_images = await self._extract_content_from_event(event)
         images.extend(event_images)
 
-        # Prepend extracted text context from Reply/Node/Nodes to the query
-        if extra_texts:
-            context_text = "\n".join(extra_texts)
+        # 将引用/转发消息中提取的文本拼接到查询前面作为上下文
+        if extra_text:
             query = (
-                f"[Referenced message content]\n{context_text}\n\n[User query]\n{query}"
+                f"[Referenced message content]\n{extra_text}\n\n[User query]\n{query}"
             )
 
         if images:
