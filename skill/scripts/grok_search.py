@@ -1,4 +1,5 @@
 import argparse
+import base64
 import json
 import os
 import re
@@ -239,6 +240,7 @@ def _request_chat_completions(
     thinking_budget: int,
     extra_headers: dict[str, Any],
     extra_body: dict[str, Any],
+    images: list[str] | None = None,
 ) -> dict[str, Any]:
     url = f"{_normalize_base_url(base_url)}/v1/chat/completions"
 
@@ -250,11 +252,25 @@ def _request_chat_completions(
         "IMPORTANT: Do NOT use Markdown formatting in the content field - use plain text only."
     )
 
+    # Build user message: multimodal format when images are present
+    if images:
+        user_content: list[dict[str, Any]] = [{"type": "text", "text": query}]
+        for img_b64 in images:
+            user_content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/*;base64,{img_b64}"},
+                }
+            )
+        user_message: dict[str, Any] = {"role": "user", "content": user_content}
+    else:
+        user_message = {"role": "user", "content": query}
+
     body: dict[str, Any] = {
         "model": model,
         "messages": [
             {"role": "system", "content": system},
-            {"role": "user", "content": query},
+            user_message,
         ],
         "temperature": 0.2,
         "stream": False,
@@ -332,6 +348,11 @@ def main() -> int:
         "--extra-headers-json",
         default="",
         help="Extra JSON object merged into request headers.",
+    )
+    parser.add_argument(
+        "--image-files",
+        default="",
+        help="Comma-separated image file paths for multimodal queries.",
     )
     args = parser.parse_args()
 
@@ -487,6 +508,23 @@ def main() -> int:
         sys.stderr.write(f"Invalid JSON: {e}\n")
         return 2
 
+    # Read image files and convert to base64
+    images: list[str] = []
+    if args.image_files:
+        for img_path in args.image_files.split(","):
+            img_path = img_path.strip()
+            if not img_path:
+                continue
+            if not os.path.exists(img_path):
+                sys.stderr.write(f"Image file not found: {img_path}\n")
+                continue
+            try:
+                with open(img_path, "rb") as f:
+                    img_data = base64.b64encode(f.read()).decode("utf-8")
+                images.append(img_data)
+            except Exception as e:
+                sys.stderr.write(f"Failed to read image file {img_path}: {e}\n")
+
     started = time.time()
     try:
         resp = _request_chat_completions(
@@ -499,6 +537,7 @@ def main() -> int:
             thinking_budget=thinking_budget,
             extra_headers=extra_headers,
             extra_body=extra_body,
+            images=images or None,
         )
     except urllib.error.HTTPError as e:
         raw = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else ""

@@ -1,6 +1,6 @@
 # Grok 联网搜索 (astrbot_plugin_grok_web_search)
 
-通过 Grok API 进行实时联网搜索，返回综合答案和来源链接。
+通过 Grok API 进行实时联网搜索，返回综合答案和来源链接。支持多模态图片搜索。
 
 ## 环境要求
 
@@ -14,9 +14,9 @@
 
 ## 功能
 
-- `/grok` 指令 - 直接执行搜索
-- LLM Tool (`grok_web_search`) - 供 LLM 自动调用的函数工具
-- Skill 脚本 - 可安装到 skills 目录供 LLM 脚本调用
+- `/grok` 指令 - 直接执行搜索，支持附带图片进行多模态搜索
+- LLM Tool (`grok_web_search`) - 供 LLM 自动调用的函数工具，自动提取用户消息中的图片
+- Skill 脚本 - 可安装到 skills 目录供 LLM 脚本调用，支持 `--image-files` 传入图片
 
 ## 安装
 
@@ -83,6 +83,12 @@
 /grok help              # 显示帮助和当前配置状态
 ```
 
+发送图片时附带 `/grok` 指令，可进行多模态图片搜索：
+
+```
+[图片] /grok 这张图片里有什么？
+```
+
 > `/grok help` 会显示当前供应商来源、模型、系统提示词类型等配置信息。
 
 ### 重试机制
@@ -94,11 +100,17 @@
 
 ### LLM Tool
 
-当 LLM 需要搜索实时信息时，会自动调用 `grok_web_search` 工具。
+当 LLM 需要搜索实时信息时，会自动调用 `grok_web_search` 工具。如果用户消息中包含图片，工具会自动提取图片进行多模态搜索。LLM 也可以通过 `image_urls` 参数主动传入图片链接。
 
 ### Skill
 
 开启 `enable_skill` 后，会安装 Skill 到 `data/skills/grok-search/`，LLM 可读取 SKILL.md 后执行脚本。
+
+Skill 脚本支持通过 `--image-files` 参数传入本地图片进行多模态搜索：
+
+```bash
+python scripts/grok_search.py --query "这张图片是什么？" --image-files "/path/to/image.jpg"
+```
 
 ## 输出示例
 

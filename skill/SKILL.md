@@ -42,6 +42,8 @@ export GROK_MODEL="grok-4-expert"  # optional
 
 ```bash
 python scripts/grok_search.py --query "your search query"
+# With images for multimodal queries:
+python scripts/grok_search.py --query "What is in this image?" --image-files "/path/to/image.jpg"
 ```
 
 ### Options
@@ -56,6 +58,7 @@ python scripts/grok_search.py --query "your search query"
 | `--timeout-seconds` | Request timeout in seconds |
 | `--extra-body-json` | Extra JSON to merge into request body |
 | `--extra-headers-json` | Extra JSON to merge into request headers |
+| `--image-files` | Comma-separated image file paths for multimodal queries |
 
 ## Output
 

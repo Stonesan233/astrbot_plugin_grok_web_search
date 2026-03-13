@@ -115,6 +115,7 @@ async def grok_search(
     max_retries: int = 3,
     retry_delay: float = 1.0,
     retryable_status_codes: set[int] | None = None,
+    images: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     调用 Grok API 进行联网搜索（异步）
@@ -134,6 +135,7 @@ async def grok_search(
         max_retries: 最大重试次数（默认 3 次）
         retry_delay: 重试间隔时间（秒，默认 1.0）
         retryable_status_codes: 可重试的 HTTP 状态码集合，为 None 时使用默认值
+        images: 可选的 base64 编码图片列表，用于构建多模态消息
 
     Returns:
         {
@@ -179,11 +181,25 @@ async def grok_search(
         system_prompt if system_prompt is not None else DEFAULT_JSON_SYSTEM_PROMPT
     )
 
+    # 构建用户消息：如果有图片则使用多模态格式
+    if images:
+        user_content: list[dict[str, Any]] = [{"type": "text", "text": query}]
+        for img_b64 in images:
+            user_content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/*;base64,{img_b64}"},
+                }
+            )
+        user_message: dict[str, Any] = {"role": "user", "content": user_content}
+    else:
+        user_message = {"role": "user", "content": query}
+
     # 构建请求体：仅当提供 model 时才添加 model 字段（允许供应商/端点使用默认模型）
     body: dict[str, Any] = {
         "messages": [
             {"role": "system", "content": final_system_prompt},
-            {"role": "user", "content": query},
+            user_message,
         ],
         "temperature": 0.2,
         "stream": False,
