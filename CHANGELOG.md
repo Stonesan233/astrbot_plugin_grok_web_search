@@ -2,6 +2,25 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [1.1.0] - 2026-03-13
+
+### Added
+- **图片搜索**：`/grok` 指令、`grok_web_search` LLM Tool、Skill 脚本均支持图片输入
+- `/grok` 指令：自动提取用户消息中的图片，支持直接发送图片、回复带图片的消息、QQ 转发消息（嵌套）
+- `/grok` 指令：自动提取回复消息和转发消息中的文本内容作为查询上下文
+- `grok_web_search` LLM Tool：新增 `image_urls` 参数，支持传入图片 URL 或 base64 链接
+- `grok_web_search` LLM Tool：自动提取用户消息中的图片和文本上下文
+- Skill 脚本：新增 `--image-files` 参数，支持传入本地图片文件路径
+- `grok_client.py`：`grok_search()` 支持 `images` 参数，构建 OpenAI 接口的`image_url` 消息
+
+### Changed
+- CI 工作流改为自动修复模式：`ruff format` + `ruff check --fix`，格式变更自动提交
+
+
+<details>
+<summary>历史版本</summary>
+
+
 ## [1.0.5] - 2026-02-12
 
 ### Added
@@ -27,8 +46,6 @@
 - 修复 `/grok` 指令发送失败后 LLM 兜底重复调用 `grok_web_search` 的问题
 - 修复自定义供应商模式下 `/grok help` 仍显示内置供应商名称的问题
 
-<details>
-<summary>历史版本</summary>
 
 ## [1.0.4] - 2026-02-03
 
