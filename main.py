@@ -600,23 +600,35 @@ class GrokSearchPlugin(Star):
 
         用法: /grok <搜索内容>
         """
-        if not query or query.strip().lower() == "help":
-            yield event.plain_result(self._help_text())
-            return
-
-        # Extract text and images from user's message (including Reply/Node/Nodes)
+        # Extract text and images from user's message first (including Reply/Node/Nodes)
         extra_texts, images = await self._extract_content_from_event(event)
         if images:
             logger.info(
                 f"[{PLUGIN_NAME}] /grok command: extracted {len(images)} image(s) from message"
             )
 
+        # Show help only when explicitly requested
+        if query.strip().lower() == "help":
+            yield event.plain_result(self._help_text())
+            return
+
+        # If no query text but has images or referenced content, use a default prompt
+        has_content = bool(images) or bool(extra_texts)
+        if not query.strip() and not has_content:
+            yield event.plain_result(self._help_text())
+            return
+
         # Prepend extracted text context from Reply/Node/Nodes to the query
         if extra_texts:
             context_text = "\n".join(extra_texts)
-            query = (
-                f"[Referenced message content]\n{context_text}\n\n[User query]\n{query}"
-            )
+            if query.strip():
+                query = f"[Referenced message content]\n{context_text}\n\n[User query]\n{query}"
+            else:
+                query = context_text
+
+        # If only images with no text at all, use a default prompt
+        if not query.strip() and images:
+            query = "请描述这张图片的内容"
 
         # 优先使用自定义提示词，未设置则使用内置中文提示词
         custom_prompt = self.config.get("custom_system_prompt", "")
