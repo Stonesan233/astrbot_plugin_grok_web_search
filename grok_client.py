@@ -1,7 +1,9 @@
 """
 Grok API 异步客户端
 
-通过 OpenAI 兼容接口调用 Grok 进行联网搜索
+通过 xAI Responses API 调用 Grok 进行真正的联网搜索
+重要：使用 /v1/responses 端点而非 /v1/chat/completions
+因为只有 Responses API 才支持 web_search 工具实现真正的联网搜索
 """
 
 import asyncio
@@ -116,9 +118,13 @@ async def grok_search(
     retry_delay: float = 1.0,
     retryable_status_codes: set[int] | None = None,
     images: list[str] | None = None,
+    proxy: str | None = None,
 ) -> dict[str, Any]:
     """
     调用 Grok API 进行联网搜索（异步）
+
+    使用 xAI Responses API (/v1/responses) 而非 Chat Completions API (/v1/chat/completions)
+    因为只有 Responses API 才支持 web_search 工具实现真正的联网搜索
 
     Args:
         query: 搜索查询内容
@@ -126,8 +132,8 @@ async def grok_search(
         api_key: API 密钥
         model: 模型名称
         timeout: 超时时间（秒）
-        enable_thinking: 是否开启思考模式
-        thinking_budget: 思考 token 预算
+        enable_thinking: 是否开启思考模式（已弃用，Grok 4.20+ 通过模型名称区分）
+        thinking_budget: 思考 token 预算（已弃用）
         extra_body: 额外请求体参数
         extra_headers: 额外请求头
         session: 可选的 aiohttp.ClientSession，传入时复用，否则创建临时 session
@@ -136,6 +142,7 @@ async def grok_search(
         retry_delay: 重试间隔时间（秒，默认 1.0）
         retryable_status_codes: 可重试的 HTTP 状态码集合，为 None 时使用默认值
         images: 可选的 base64 编码图片列表，用于构建多模态消息
+        proxy: HTTP 代理地址，例如 http://127.0.0.1:7890
 
     Returns:
         {
@@ -146,6 +153,7 @@ async def grok_search(
             "error": str,        # 错误信息（失败时）
             "elapsed_ms": int,   # 耗时
             "retries": int,      # 重试次数
+            "citations": list,   # 引用来源列表（来自 API）
         }
     """
     started = time.time()
@@ -174,48 +182,42 @@ async def grok_search(
             "elapsed_ms": int((time.time() - started) * 1000),
         }
 
-    url = f"{normalize_base_url(base_url)}/v1/chat/completions"
+    # 使用 Responses API 端点（而非 chat/completions）
+    url = f"{normalize_base_url(base_url)}/v1/responses"
 
     # 使用自定义提示词或默认提示词
     final_system_prompt = (
         system_prompt if system_prompt is not None else DEFAULT_JSON_SYSTEM_PROMPT
     )
 
-    # 构建用户消息：如果有图片则使用多模态格式
+    # 构建用户消息内容
     if images:
-        user_content: list[dict[str, Any]] = [{"type": "text", "text": query}]
+        user_content: list[dict[str, Any]] = [{"type": "input_text", "text": query}]
         for img_b64 in images:
             user_content.append(
                 {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/*;base64,{img_b64}"},
+                    "type": "input_image",
+                    "image_url": f"data:image/*;base64,{img_b64}",
                 }
             )
-        user_message: dict[str, Any] = {"role": "user", "content": user_content}
+        user_input = user_content
     else:
-        user_message = {"role": "user", "content": query}
+        user_input = query
 
-    # 构建请求体：仅当提供 model 时才添加 model 字段（允许供应商/端点使用默认模型）
+    # 构建 Responses API 请求体
     body: dict[str, Any] = {
-        "messages": [
+        "model": model,
+        "input": [
             {"role": "system", "content": final_system_prompt},
-            user_message,
+            {"role": "user", "content": user_input},
         ],
-        "temperature": 0.2,
-        "stream": False,
+        # 启用 web_search 工具实现真正的联网搜索
+        "tools": [{"type": "web_search"}],
     }
-    if model:
-        body["model"] = model
-
-    # 添加思考模式参数
-    if enable_thinking:
-        body["reasoning_effort"] = "high"
-        if thinking_budget > 0:
-            body["reasoning_budget_tokens"] = thinking_budget
 
     if extra_body:
         # 保护关键字段不被覆盖
-        protected_keys = {"model", "messages", "stream"}
+        protected_keys = {"model", "input", "tools", "stream"}
         for key, value in extra_body.items():
             if key not in protected_keys:
                 body[key] = value
@@ -231,70 +233,25 @@ async def grok_search(
             if str(key).lower() not in protected_headers:
                 headers[str(key)] = str(value)
 
-    def _parse_sse_response(raw_text: str) -> dict[str, Any] | None:
-        """解析 SSE 流式响应，合并所有 chunk 的内容"""
-        chunks: list[dict[str, Any]] = []
-        for line in raw_text.splitlines():
-            line = line.strip()
-            if not line or line.startswith(":"):
-                continue
-            if line.startswith("data:"):
-                data_str = line[5:].strip()
-                if data_str == "[DONE]":
-                    continue
-                try:
-                    chunk = json.loads(data_str)
-                    if isinstance(chunk, dict):
-                        chunks.append(chunk)
-                except json.JSONDecodeError:
-                    continue
-
-        if not chunks:
-            return None
-
-        # 合并所有 chunk 的 delta content
-        merged_content = ""
-        model_name = ""
-        usage_info = {}
-
-        for chunk in chunks:
-            if not model_name:
-                model_name = chunk.get("model", "")
-            if chunk.get("usage"):
-                usage_info = chunk["usage"]
-
-            choices = chunk.get("choices", [])
-            if choices and isinstance(choices, list):
-                choice = choices[0]
-                delta = choice.get("delta", {})
-                if delta and isinstance(delta, dict):
-                    content = delta.get("content", "")
-                    if content:
-                        merged_content += content
-
-        return {
-            "choices": [{"message": {"content": merged_content}}],
-            "model": model_name,
-            "usage": usage_info,
-        }
-
     async def _do_request(
         s: aiohttp.ClientSession,
+        proxy: str | None = None,
     ) -> dict[str, Any]:
         async with s.post(
             url,
             json=body,
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=timeout),
+            proxy=proxy,
         ) as resp:
             if resp.status != 200:
                 error_text = await resp.text()
                 # 友好的错误提示
                 error_hints = {
-                    400: "请求格式错误，请检查 extra_body 配置",
+                    400: "请求格式错误，请检查配置",
                     401: "认证失败，请检查 api_key 是否正确",
                     403: "访问被拒绝，请检查 API 权限",
-                    404: "API 端点不存在，请检查 base_url 配置",
+                    404: "API 端点不存在，请检查 base_url 配置（应使用 /v1/responses）",
                     429: "请求过于频繁，请稍后重试",
                     500: "服务器内部错误",
                     502: "网关错误，API 服务可能暂时不可用",
@@ -315,30 +272,11 @@ async def grok_search(
 
             # 读取响应内容
             raw_text = await resp.text()
-            content_type = resp.headers.get("Content-Type", "")
-
-            # 检查是否为 SSE 流式响应
-            is_sse = "text/event-stream" in content_type or raw_text.strip().startswith(
-                "data:"
-            )
-
-            if is_sse:
-                # 解析 SSE 流式响应
-                parsed = _parse_sse_response(raw_text)
-                if parsed:
-                    return {"ok": True, "data": parsed}
-                return {
-                    "ok": False,
-                    "error": "SSE 流式响应解析失败",
-                    "content": "",
-                    "sources": [],
-                    "raw": raw_text[:2000] if raw_text else "",
-                    "elapsed_ms": int((time.time() - started) * 1000),
-                }
 
             # 尝试解析 JSON 响应
             try:
-                return {"ok": True, "data": json.loads(raw_text)}
+                data = json.loads(raw_text)
+                return {"ok": True, "data": data}
             except json.JSONDecodeError as e:
                 return {
                     "ok": False,
@@ -360,10 +298,10 @@ async def grok_search(
     for attempt in range(max_retries + 1):
         try:
             if session is not None:
-                result = await _do_request(session)
+                result = await _do_request(session, proxy=proxy)
             else:
                 async with aiohttp.ClientSession() as temp_session:
-                    result = await _do_request(temp_session)
+                    result = await _do_request(temp_session, proxy=proxy)
 
             # 检查是否需要重试
             if result.get("ok"):
@@ -435,9 +373,12 @@ async def grok_search(
         return result
     data = result["data"]
 
-    # 解析响应
+    # 解析 Responses API 响应
     message = ""
+    citations: list[dict[str, str]] = []
+    usage_info = {}
     parse_error = ""
+
     try:
         # 检查 API 错误响应
         if "error" in data and isinstance(data.get("error"), (dict, str)):
@@ -456,15 +397,42 @@ async def grok_search(
                 "elapsed_ms": int((time.time() - started) * 1000),
             }
 
-        choices = data.get("choices")
-        if not choices or not isinstance(choices, list):
-            parse_error = f"响应缺少 choices 字段或格式异常: {type(choices).__name__}"
+        # Responses API 的响应格式：
+        # output 是一个数组，包含 web_search_call、reasoning、message 等元素
+        output = data.get("output", [])
+        if not output:
+            parse_error = "响应缺少 output 字段"
         else:
-            choice0 = choices[0] if choices else {}
-            msg = choice0.get("message") or {}
-            message = msg.get("content") or ""
-            if not message:
-                parse_error = "choices[0].message.content 为空"
+            # 查找 message 类型的输出（最终回复）
+            for item in output:
+                if item.get("type") == "message":
+                    content_list = item.get("content", [])
+                    for content_item in content_list:
+                        if content_item.get("type") == "output_text":
+                            message = content_item.get("text", "")
+                            # 提取引用/注释（citations）
+                            annotations = content_item.get("annotations", [])
+                            for ann in annotations:
+                                if ann.get("type") == "url_citation":
+                                    citations.append({
+                                        "url": ann.get("url", ""),
+                                        "title": ann.get("title", ""),
+                                    })
+                            break
+                    break
+
+            # 提取 usage 信息
+            usage = data.get("usage", {})
+            if usage:
+                usage_info = {
+                    "input_tokens": usage.get("input_tokens", 0),
+                    "output_tokens": usage.get("output_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                }
+
+        if not message:
+            parse_error = parse_error or "API 返回了空响应"
+
     except (KeyError, IndexError, TypeError) as e:
         parse_error = f"响应结构解析失败: {type(e).__name__}: {e}"
 
@@ -478,8 +446,10 @@ async def grok_search(
             "sources": [],
             "raw": json.dumps(data, ensure_ascii=False)[:2000] if data else "",
             "elapsed_ms": int((time.time() - started) * 1000),
+            "retries": retry_count,
         }
 
+    # 尝试解析 JSON 格式的响应
     parsed = _coerce_json_object(message)
     sources: list[dict[str, Any]] = []
     content = ""
@@ -507,13 +477,23 @@ async def grok_search(
         for url_str in _extract_urls(message):
             sources.append({"url": url_str, "title": "", "snippet": ""})
 
+    # 如果没有从 JSON 中提取到 sources，使用 API 返回的 citations
+    if not sources and citations:
+        for cit in citations:
+            sources.append({
+                "url": cit.get("url", ""),
+                "title": cit.get("title", ""),
+                "snippet": "",
+            })
+
     return {
         "ok": True,
         "content": content,
         "sources": sources,
         "raw": raw,
         "model": data.get("model") or model,
-        "usage": data.get("usage") or {},
+        "usage": usage_info,
         "elapsed_ms": int((time.time() - started) * 1000),
         "retries": retry_count,
+        "citations": citations,
     }

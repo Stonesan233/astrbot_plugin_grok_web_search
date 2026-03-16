@@ -123,5 +123,11 @@
     "description": "额外请求头（JSON 格式）",
     "hint": "例如: {\"X-Custom-Header\": \"value\"}",
     "default": "{}"
+  },
+  "proxy": {
+    "type": "string",
+    "description": "HTTP 代理地址",
+    "hint": "例如: http://127.0.0.1:7890，留空则不使用代理",
+    "default": ""
   }
 }

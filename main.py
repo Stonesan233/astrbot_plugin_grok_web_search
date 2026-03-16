@@ -160,12 +160,17 @@ class GrokSearchPlugin(Star):
             for key, value in extra_headers.items():
                 if str(key).lower() not in protected:
                     headers[str(key)] = str(value)
+
+        # 获取代理配置
+        proxy = self.config.get("proxy", "").strip() or None
+
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     models_url,
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=10),
+                    proxy=proxy,
                 ) as resp:
                     if resp.status == 401:
                         logger.warning(
@@ -477,6 +482,9 @@ class GrokSearchPlugin(Star):
 
         # 否则使用 HTTP 客户端向外部 Grok API 发起请求
         try:
+            # 获取代理配置
+            proxy = self.config.get("proxy", "").strip() or None
+
             result = await grok_search(
                 query=query,
                 base_url=self.config.get("base_url", ""),
@@ -493,6 +501,7 @@ class GrokSearchPlugin(Star):
                 retry_delay=retry_delay,
                 retryable_status_codes=retryable_status_codes,
                 images=images,
+                proxy=proxy,
             )
         except Exception as e:
             logger.error(f"[{PLUGIN_NAME}] API 调用异常: {e}")
