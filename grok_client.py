@@ -23,6 +23,35 @@ DEFAULT_JSON_SYSTEM_PROMPT = (
     "IMPORTANT: Do NOT use Markdown formatting in the content field - use plain text only."
 )
 
+# x_search 专用系统提示词（要求返回图片和视频 URL）
+X_SEARCH_SYSTEM_PROMPT = (
+    "You are a Twitter/X search assistant. When searching tweets, extract ALL media URLs. "
+    "Return ONLY a JSON object with this exact structure:\n"
+    "{\n"
+    '  "content": "brief summary of search results in Chinese",\n'
+    '  "sources": [{"url": "tweet_url", "title": "author", "snippet": "tweet text"}],\n'
+    '  "tweets": [\n'
+    "    {\n"
+    '      "author": "@username",\n'
+    '      "text": "original tweet content",\n'
+    '      "translation": "中文翻译 (如果原文不是中文，必须翻译成中文)",\n'
+    '      "tweet_url": "https://x.com/status/...",\n'
+    '      "images": ["https://pbs.twimg.com/media/..."],\n'
+    '      "videos": ["https://video.twimg.com/..."]\n'
+    "    }\n"
+    "  ],\n"
+    '  "images": ["https://pbs.twimg.com/media/..."],\n'
+    '  "videos": ["https://video.twimg.com/..."]\n'
+    "}\n"
+    "CRITICAL REQUIREMENTS:\n"
+    "1. The 'images' array MUST contain ALL image URLs (pbs.twimg.com) from the tweets\n"
+    "2. The 'videos' array MUST contain ALL video URLs (video.twimg.com) from the tweets\n"
+    "3. Do NOT leave media arrays empty if tweets contain media\n"
+    "4. Flatten all media URLs into top-level 'images' and 'videos' arrays for easy access\n"
+    "5. Keep content concise, do NOT use Markdown formatting\n"
+    "6. TRANSLATION IS MANDATORY: For every tweet, provide its Chinese translation in the 'translation' field. If the original tweet is already in Chinese, copy it as-is."
+)
+
 
 def normalize_api_key(api_key: str) -> str:
     """过滤占位符 API Key"""
@@ -61,16 +90,47 @@ def _normalize_base_url_value(base_url: str) -> str:
 
 
 def _coerce_json_object(text: str) -> dict[str, Any] | None:
-    """尝试将字符串解析为 JSON 对象"""
+    """尝试将字符串解析为 JSON 对象，支持多种格式：
+    1. 纯 JSON 对象
+    2. Markdown 代码块包裹的 JSON
+    3. 混合文本中的 JSON（从第一个 { 到最后一个 }）
+    """
     text = text.strip()
     if not text:
         return None
+
+    # 尝试直接解析纯 JSON
     if text.startswith("{") and text.endswith("}"):
         try:
             value = json.loads(text)
             return value if isinstance(value, dict) else None
         except json.JSONDecodeError:
-            return None
+            pass
+
+    # 尝试提取 Markdown 代码块中的 JSON
+    code_block_pattern = r"```(?:json)?\s*\n?([\s\S]*?)\n?```"
+    matches = re.findall(code_block_pattern, text)
+    for match in matches:
+        try:
+            parsed = json.loads(match.strip())
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            continue
+
+    # 尝试从混合文本中提取 JSON（从第一个 { 到最后一个 }）
+    first_brace = text.find("{")
+    last_brace = text.rfind("}")
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        json_str = text[first_brace : last_brace + 1]
+        try:
+            parsed = json.loads(json_str)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            # 尝试修复常见的 JSON 格式问题
+            pass
+
     return None
 
 
@@ -154,6 +214,9 @@ async def grok_search(
             "elapsed_ms": int,   # 耗时
             "retries": int,      # 重试次数
             "citations": list,   # 引用来源列表（来自 API）
+            "images": list,      # 图片 URL 列表（来自 x_search）
+            "videos": list,      # 视频 URL 列表（来自 x_search）
+            "tweets": list,      # 推文详情列表 [{author, text, tweet_url, images, videos}]
         }
     """
     started = time.time()
@@ -454,13 +517,23 @@ async def grok_search(
         }
 
     # 尝试解析 JSON 格式的响应
+    print(f"[DEBUG grok_client] Attempting to parse message (first 300 chars): {message[:300]}", flush=True)
     parsed = _coerce_json_object(message)
+    print(f"[DEBUG grok_client] Parsed result: {parsed is not None}, type: {type(parsed)}", flush=True)
+    if parsed:
+        print(f"[DEBUG grok_client] Parsed keys: {list(parsed.keys())}", flush=True)
+        print(f"[DEBUG grok_client] images field: {parsed.get('images')}", flush=True)
     sources: list[dict[str, Any]] = []
     content = ""
     raw = ""
+    images: list[str] = []
+    videos: list[str] = []
+    tweets: list[dict[str, Any]] = []
 
     if parsed is not None:
         content = str(parsed.get("content") or "")
+
+        # 提取 sources
         src = parsed.get("sources")
         if isinstance(src, list):
             for item in src:
@@ -475,11 +548,58 @@ async def grok_search(
         if not sources:
             for url_str in _extract_urls(content):
                 sources.append({"url": url_str, "title": "", "snippet": ""})
+
+        # 提取图片 URL
+        img_list = parsed.get("images")
+        if isinstance(img_list, list):
+            for img_url in img_list:
+                if isinstance(img_url, str) and img_url.startswith("http"):
+                    images.append(img_url)
+
+        # 提取视频 URL
+        vid_list = parsed.get("videos")
+        if isinstance(vid_list, list):
+            for vid_url in vid_list:
+                if isinstance(vid_url, str) and vid_url.startswith("http"):
+                    videos.append(vid_url)
+
+        # 提取 tweets 详情
+        print(f"[DEBUG grok_client] tweets from parsed: {parsed.get('tweets')}", flush=True)
+        tweet_list = parsed.get("tweets")
+        if isinstance(tweet_list, list):
+            for tweet in tweet_list:
+                if isinstance(tweet, dict):
+                    tweet_info: dict[str, Any] = {
+                        "author": str(tweet.get("author") or ""),
+                        "text": str(tweet.get("text") or ""),
+                        "translation": str(tweet.get("translation") or ""),
+                        "tweet_url": str(tweet.get("tweet_url") or ""),
+                        "images": [],
+                        "videos": [],
+                    }
+                    # 提取单条推文中的图片
+                    tweet_images = tweet.get("images")
+                    if isinstance(tweet_images, list):
+                        for img_url in tweet_images:
+                            if isinstance(img_url, str) and img_url.startswith("http"):
+                                tweet_info["images"].append(img_url)
+                    # 提取单条推文中的视频
+                    tweet_videos = tweet.get("videos")
+                    if isinstance(tweet_videos, list):
+                        for vid_url in tweet_videos:
+                            if isinstance(vid_url, str) and vid_url.startswith("http"):
+                                tweet_info["videos"].append(vid_url)
+                    tweets.append(tweet_info)
     else:
         raw = message
         content = message
         for url_str in _extract_urls(message):
             sources.append({"url": url_str, "title": "", "snippet": ""})
+        # 从文本中提取图片 URL (当 JSON 解析失败时的后备方案)
+        for img_url in re.findall(r'https://pbs\.twimg\.com/[^\s)\]}>\"\']+', message):
+            img_url = img_url.rstrip(".,;:!?'\"")
+            if img_url and img_url not in images:
+                images.append(img_url)
 
     # 如果没有从 JSON 中提取到 sources，使用 API 返回的 citations
     if not sources and citations:
@@ -500,4 +620,7 @@ async def grok_search(
         "elapsed_ms": int((time.time() - started) * 1000),
         "retries": retry_count,
         "citations": citations,
+        "images": images,
+        "videos": videos,
+        "tweets": tweets,
     }

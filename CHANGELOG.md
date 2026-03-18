@@ -2,6 +2,23 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [1.2.2] - 2026-03-19
+
+### Added
+- **推文翻译功能**：x_search 搜索推文时自动附带中文翻译
+  - 在 `X_SEARCH_SYSTEM_PROMPT` 中添加 `translation` 字段要求
+  - 非中文推文自动翻译，中文推文保持原样
+- **推文图片推送**：x_search 搜索结果自动推送推文中的图片
+  - 新增 `enable_search_images` 配置项：是否推送搜索结果中的图片（默认开启）
+  - 新增 `enable_search_videos` 配置项：是否推送搜索结果中的视频（默认关闭）
+  - 新增 `max_search_images` 配置项：最大推送图片数量（默认 5）
+  - 新增 `max_search_videos` 配置项：最大推送视频数量（默认 2）
+- **图文绑定发送**：推文文本和图片绑定发送，提升阅读体验
+
+### Changed
+- 优化 `_coerce_json_object()` 函数，支持从混合文本中提取 JSON
+- 优化 `_send_search_result_with_media()` 方法，支持推文详情和图片发送
+
 ## [1.2.1] - 2026-03-17
 
 ### Added

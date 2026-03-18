@@ -97,6 +97,40 @@
     "hint": "控制返回的来源链接数量.0 表示不限制",
     "default": 5
   },
+  "enable_search_images": {
+    "type": "bool",
+    "description": "是否推送搜索结果中的图片",
+    "hint": "启用后将在 x_search 结果中自动推送推文图片",
+    "default": true
+  },
+  "enable_search_videos": {
+    "type": "bool",
+    "description": "是否推送搜索结果中的视频",
+    "hint": "启用后将在 x_search 结果中自动推送推文视频（部分平台可能不支持）",
+    "default": false
+  },
+  "max_search_images": {
+    "type": "int",
+    "description": "最大推送图片数量",
+    "hint": "单次搜索结果最多推送的图片数量",
+    "default": 5,
+    "slider": {
+      "min": 1,
+      "max": 10,
+      "step": 1
+    }
+  },
+  "max_search_videos": {
+    "type": "int",
+    "description": "最大推送视频数量",
+    "hint": "单次搜索结果最多推送的视频数量",
+    "default": 2,
+    "slider": {
+      "min": 0,
+      "max": 5,
+      "step": 1
+    }
+  },
   "custom_system_prompt": {
     "type": "text",
     "description": "自定义系统提示词",

@@ -33,6 +33,7 @@ from astrbot.core.provider.func_tool_manager import FunctionToolManager
 
 from .grok_client import (
     DEFAULT_JSON_SYSTEM_PROMPT,
+    X_SEARCH_SYSTEM_PROMPT,
     grok_search,
     normalize_api_key,
     normalize_base_url,
@@ -409,11 +410,34 @@ class GrokSearchPlugin(Star):
                         }
 
                     # 尝试解析 JSON 格式响应
+                    logger.info(f"[{PLUGIN_NAME}] Builtin provider response text (first 500 chars): {text[:500]}")
                     parsed = self._try_parse_json_response(text)
+                    logger.info(f"[{PLUGIN_NAME}] JSON parsed result: {parsed is not None}")
                     if parsed is not None:
                         content = str(parsed.get("content", ""))
                         raw_sources = parsed.get("sources", [])
                         sources = self._normalize_sources(raw_sources)
+
+                        # 提取图片和视频 URL
+                        images: list[str] = []
+                        videos: list[str] = []
+
+                        img_list = parsed.get("images")
+                        if isinstance(img_list, list):
+                            for img_url in img_list:
+                                if isinstance(img_url, str) and img_url.startswith("http"):
+                                    images.append(img_url)
+
+                        vid_list = parsed.get("videos")
+                        if isinstance(vid_list, list):
+                            for vid_url in vid_list:
+                                if isinstance(vid_url, str) and vid_url.startswith("http"):
+                                    videos.append(vid_url)
+
+                        logger.info(
+                            f"[{PLUGIN_NAME}] Builtin provider parsed: {len(images)} images, {len(videos)} videos"
+                        )
+
                         return {
                             "ok": True,
                             "content": content,
@@ -422,6 +446,8 @@ class GrokSearchPlugin(Star):
                             "retries": attempts,
                             "usage": usage,
                             "raw": "",
+                            "images": images,
+                            "videos": videos,
                         }
 
                     # JSON 解析失败，降级处理：提取纯文本和 URL
@@ -471,6 +497,8 @@ class GrokSearchPlugin(Star):
                         "retries": attempts,
                         "usage": usage,
                         "raw": text,
+                        "images": [],
+                        "videos": [],
                     }
 
                 except Exception as e:
@@ -481,6 +509,7 @@ class GrokSearchPlugin(Star):
                     await asyncio.sleep(retry_delay * attempts)
 
         # 否则使用 HTTP 客户端向外部 Grok API 发起请求
+        logger.info(f"[{PLUGIN_NAME}] Using external API, system_prompt type: {type(system_prompt).__name__ if system_prompt else 'None'}")
         try:
             # 获取代理配置
             proxy = self.config.get("proxy", "").strip() or None
@@ -511,6 +540,8 @@ class GrokSearchPlugin(Star):
             logger.warning(
                 f"[{PLUGIN_NAME}] API 调用失败: {result.get('error', '未知错误')}"
             )
+
+        logger.info(f"[{PLUGIN_NAME}] API result: images={result.get('images', [])}, videos={result.get('videos', [])}")
         return result
 
     def _format_result(self, result: dict) -> str:
@@ -757,6 +788,8 @@ class GrokSearchPlugin(Star):
 
         用法: /grok <搜索内容>
         """
+        print(f"[DEBUG] grok_cmd called, query={query}", flush=True)  # 强制打印
+
         # 提取消息中的文本和图片（包括引用消息/转发消息）
         extra_text, images = await self._extract_content_from_event(event)
         if images:
@@ -786,10 +819,24 @@ class GrokSearchPlugin(Star):
         if not query.strip() and images:
             query = "请搜索这张图片的内容"
 
-        # 优先使用自定义提示词，未设置则使用内置提示词（英文指令 + JSON 格式 + 中文回复）
+        # 检测是否为 Twitter/X 相关搜索，使用 x_search 专用提示词
+        query_lower = query.lower()
+        is_twitter_search = any(
+            keyword in query_lower
+            for keyword in ["twitter", "x.com", "推文", "tweet", "elon", "musk", "x 上", "x搜索", "推特", "最新推", "x最新"]
+        )
+        logger.info(f"[{PLUGIN_NAME}] Twitter search detection: {is_twitter_search}, query: {query[:100]}")
+
+        # 优先使用自定义提示词，未设置则根据搜索类型选择内置提示词
         custom_prompt = self.config.get("custom_system_prompt", "")
         if custom_prompt and isinstance(custom_prompt, str) and custom_prompt.strip():
             cmd_system_prompt = custom_prompt.strip()
+        elif is_twitter_search:
+            # Twitter/X 搜索使用专用提示词，要求返回图片和视频 URL
+            cmd_system_prompt = X_SEARCH_SYSTEM_PROMPT + (
+                "\n\nIMPORTANT: Respond in Chinese. "
+                "Keep proper nouns and names in their original language."
+            )
         else:
             cmd_system_prompt = (
                 "You are a web research assistant. Use live web search/browsing when answering. "
@@ -807,8 +854,10 @@ class GrokSearchPlugin(Star):
             images=images or None,
         )
         event.should_call_llm(True)
+
+        # 构建消息链，包含文本和媒体
         try:
-            await event.send(MessageChain().message(self._format_result(result)))
+            await self._send_search_result_with_media(event, result)
         except Exception as e:
             logger.warning(f"[{PLUGIN_NAME}] 发送搜索结果失败: {e}")
             try:
@@ -817,6 +866,165 @@ class GrokSearchPlugin(Star):
                 )
             except Exception:
                 pass
+
+    async def _send_tweets_merged(
+        self, event: AstrMessageEvent, tweets: list, enable_images: bool, max_images: int
+    ):
+        """QQ 官方机器人：合并所有推文到一条消息发送（避免被吞）"""
+        all_tweet_lines = []
+        all_images = []
+
+        for i, tweet in enumerate(tweets):
+            author = tweet.get("author", "")
+            text = tweet.get("text", "")
+            translation = tweet.get("translation", "")
+            tweet_url = tweet.get("tweet_url", "")
+            tweet_images = tweet.get("images", [])
+
+            # 添加分隔符（第一条除外）
+            if i > 0:
+                all_tweet_lines.append("─" * 15)
+
+            if author:
+                all_tweet_lines.append(f"【{author}】")
+            if text:
+                all_tweet_lines.append(text)
+            if translation and translation != text:
+                all_tweet_lines.append(f"译: {translation}")
+            if tweet_url:
+                all_tweet_lines.append(f"链接: {tweet_url}")
+
+            # 收集图片
+            if tweet_images and enable_images:
+                for img_url in tweet_images[:3]:
+                    if img_url not in all_images:
+                        all_images.append(img_url)
+
+        # 发送合并后的推文文本（一条消息）
+        if all_tweet_lines:
+            tweet_msg = "\n".join(all_tweet_lines)
+            await event.send(MessageChain().message(tweet_msg))
+            await asyncio.sleep(1.0)
+
+        # 发送图片（逐张发送，增加间隔）
+        if all_images:
+            all_images = all_images[:max_images]
+            logger.info(f"[{PLUGIN_NAME}] [QQ] Sending {len(all_images)} image(s)")
+            for img_url in all_images:
+                try:
+                    await event.send(event.image_result(img_url))
+                    await asyncio.sleep(1.0)
+                except Exception as e:
+                    logger.warning(f"[{PLUGIN_NAME}] Failed to send image {img_url}: {e}")
+
+    async def _send_tweets_bound(
+        self, event: AstrMessageEvent, tweets: list, enable_images: bool, max_images: int
+    ):
+        """其他平台：图文绑定发送（体验更好）"""
+        for i, tweet in enumerate(tweets):
+            tweet_lines = []
+            author = tweet.get("author", "")
+            text = tweet.get("text", "")
+            translation = tweet.get("translation", "")
+            tweet_url = tweet.get("tweet_url", "")
+            tweet_images = tweet.get("images", [])
+
+            if author:
+                tweet_lines.append(f"【{author}】")
+            if text:
+                tweet_lines.append(text)
+            if translation and translation != text:
+                tweet_lines.append(f"译: {translation}")
+            if tweet_url:
+                tweet_lines.append(f"链接: {tweet_url}")
+
+            if tweet_lines:
+                tweet_msg = "\n".join(tweet_lines)
+                await event.send(MessageChain().message(tweet_msg))
+
+            # 紧接着发送该推文的图片
+            if tweet_images and enable_images:
+                for img_url in tweet_images[:3]:
+                    try:
+                        await event.send(event.image_result(img_url))
+                        await asyncio.sleep(0.5)
+                    except Exception as e:
+                        logger.warning(f"[{PLUGIN_NAME}] Failed to send image {img_url}: {e}")
+
+            await asyncio.sleep(0.3)
+
+    async def _send_search_result_with_media(
+        self, event: AstrMessageEvent, result: dict
+    ):
+        """发送搜索结果，包含文本和媒体（图片/视频）"""
+        logger.info(f"[{PLUGIN_NAME}] _send_search_result_with_media called, result keys: {list(result.keys())}")
+
+        # 获取媒体配置
+        enable_images = self.config.get("enable_search_images", True)
+        enable_videos = self.config.get("enable_search_videos", False)
+        max_images = self.config.get("max_search_images", 5)
+        max_videos = self.config.get("max_search_videos", 2)
+
+        # 检测平台类型
+        platform_name = event.get_platform_name() if hasattr(event, 'get_platform_name') else ""
+        logger.info(f"[{PLUGIN_NAME}] Platform: {platform_name}")
+
+        tweets = result.get("tweets", [])
+
+        # 如果有 tweets 详情，图文绑定发送
+        if tweets:
+            logger.info(f"[{PLUGIN_NAME}] Sending {len(tweets)} tweet(s)")
+            await self._send_tweets_bound(event, tweets, enable_images, max_images)
+
+            # 发送汇总信息
+            elapsed = result.get("elapsed_ms", 0) / 1000
+            usage = result.get("usage", {})
+            total_tokens = usage.get("total_tokens", 0)
+            token_info = f", tokens: {_fmt_tokens(total_tokens)}" if total_tokens else ""
+
+            summary = f"\n(共 {len(tweets)} 条推文, 耗时: {elapsed:.1f}s{token_info})"
+            await event.send(MessageChain().message(summary))
+
+        else:
+            # 回退逻辑：没有 tweets 详情时，使用原来的方式
+            text_result = self._format_result(result)
+            await event.send(MessageChain().message(text_result))
+
+            # 发送图片
+            if enable_images:
+                image_urls = result.get("images", [])
+                logger.info(f"[{PLUGIN_NAME}] Extracted images from result: {image_urls}")
+                if image_urls:
+                    # 限制图片数量
+                    image_urls = image_urls[:max_images]
+                    logger.info(
+                        f"[{PLUGIN_NAME}] Sending {len(image_urls)} image(s) from search result"
+                    )
+                    for img_url in image_urls:
+                        try:
+                            await event.send(event.image_result(img_url))
+                            await asyncio.sleep(0.3)
+                        except Exception as e:
+                            logger.warning(
+                                f"[{PLUGIN_NAME}] Failed to send image {img_url}: {e}"
+                            )
+
+        # 发送视频（可选，单独发送）
+        if enable_videos:
+            video_urls = result.get("videos", [])
+            if video_urls:
+                video_urls = video_urls[:max_videos]
+                logger.info(
+                    f"[{PLUGIN_NAME}] Sending {len(video_urls)} video(s) from search result"
+                )
+                for video_url in video_urls:
+                    try:
+                        await event.send(MessageChain().message(f"视频链接: {video_url}"))
+                        await asyncio.sleep(0.5)
+                    except Exception as e:
+                        logger.warning(
+                            f"[{PLUGIN_NAME}] Failed to send video {video_url}: {e}"
+                        )
 
     @filter.llm_tool(name="grok_web_search")
     async def grok_tool(
