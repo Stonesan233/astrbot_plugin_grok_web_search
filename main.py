@@ -365,148 +365,80 @@ class GrokSearchPlugin(Star):
         # 如果仍然没有系统提示词，使用默认的 JSON 系统提示词
         if system_prompt is None:
             system_prompt = DEFAULT_JSON_SYSTEM_PROMPT
-        # 如果启用了使用 AstrBot 自带供应商，通过 AstrBot provider 接口调用
+        # 如果启用了使用 AstrBot 自带供应商，从 provider 提取凭证后直接调用 Responses API
         if self.config.get("use_builtin_provider", False):
-            attempts = 0
-            last_exc = None
-            started = time.time()
-            while True:
-                try:
-                    # 严格按配置获取 provider
-                    configured_provider_id = self.config.get("provider", "")
-                    if not configured_provider_id:
-                        return {
-                            "ok": False,
-                            "error": "启用了内置供应商但未选择供应商，请在插件设置中选择一个 LLM 供应商",
-                        }
-                    prov = self.context.get_provider_by_id(configured_provider_id)
-                    if not prov:
-                        return {
-                            "ok": False,
-                            "error": f"未找到配置的供应商: {configured_provider_id}",
-                        }
-
-                    provider_id = prov.meta().id
-
-                    # 将 base64 图片转为内置供应商的 image_urls 格式
-                    image_urls = (
-                        [f"base64://{img}" for img in images] if images else None
-                    )
-
-                    llm_resp = await self.context.llm_generate(
-                        chat_provider_id=provider_id,
-                        prompt=query,
-                        system_prompt=system_prompt,
-                        image_urls=image_urls,
-                    )
-
-                    text = llm_resp.completion_text or ""
-                    usage = {}
-                    if llm_resp.usage:
-                        usage = {
-                            "prompt_tokens": llm_resp.usage.input,
-                            "completion_tokens": llm_resp.usage.output,
-                            "total_tokens": llm_resp.usage.total,
-                        }
-
-                    # 尝试解析 JSON 格式响应
-                    logger.info(f"[{PLUGIN_NAME}] Builtin provider response text (first 500 chars): {text[:500]}")
-                    parsed = self._try_parse_json_response(text)
-                    logger.info(f"[{PLUGIN_NAME}] JSON parsed result: {parsed is not None}")
-                    if parsed is not None:
-                        content = str(parsed.get("content", ""))
-                        raw_sources = parsed.get("sources", [])
-                        sources = self._normalize_sources(raw_sources)
-
-                        # 提取图片和视频 URL
-                        images: list[str] = []
-                        videos: list[str] = []
-
-                        img_list = parsed.get("images")
-                        if isinstance(img_list, list):
-                            for img_url in img_list:
-                                if isinstance(img_url, str) and img_url.startswith("http"):
-                                    images.append(img_url)
-
-                        vid_list = parsed.get("videos")
-                        if isinstance(vid_list, list):
-                            for vid_url in vid_list:
-                                if isinstance(vid_url, str) and vid_url.startswith("http"):
-                                    videos.append(vid_url)
-
-                        logger.info(
-                            f"[{PLUGIN_NAME}] Builtin provider parsed: {len(images)} images, {len(videos)} videos"
-                        )
-
-                        return {
-                            "ok": True,
-                            "content": content,
-                            "sources": sources,
-                            "elapsed_ms": int((time.time() - started) * 1000),
-                            "retries": attempts,
-                            "usage": usage,
-                            "raw": "",
-                            "images": images,
-                            "videos": videos,
-                        }
-
-                    # JSON 解析失败，降级处理：提取纯文本和 URL
-                    logger.warning(
-                        f"[{PLUGIN_NAME}] 内置供应商返回非 JSON 格式，使用降级处理"
-                    )
-
-                    # 检测典型错误模式，避免将错误文案误判为成功
-                    text_lower = text.lower()
-                    error_patterns = [
-                        "rate limit",
-                        "too many requests",
-                        "quota exceeded",
-                        "authentication failed",
-                        "invalid api key",
-                        "unauthorized",
-                        "service unavailable",
-                        "internal server error",
-                        "timeout",
-                        "connection refused",
-                    ]
-                    is_error_response = any(p in text_lower for p in error_patterns)
-
-                    if not text.strip() or is_error_response:
-                        error_msg = (
-                            "提供商返回空响应"
-                            if not text.strip()
-                            else f"提供商返回错误: {text[:200]}"
-                        )
-                        return {
-                            "ok": False,
-                            "error": error_msg,
-                            "content": "",
-                            "sources": [],
-                            "elapsed_ms": int((time.time() - started) * 1000),
-                            "retries": attempts,
-                            "usage": usage,
-                            "raw": text[:500] if text else "",
-                        }
-
-                    sources = self._extract_sources_from_text(text)
+            try:
+                # 从配置的 provider 中提取 API 凭证
+                configured_provider_id = self.config.get("provider", "")
+                if not configured_provider_id:
                     return {
-                        "ok": True,
-                        "content": text,
-                        "sources": sources,
-                        "elapsed_ms": int((time.time() - started) * 1000),
-                        "retries": attempts,
-                        "usage": usage,
-                        "raw": text,
-                        "images": [],
-                        "videos": [],
+                        "ok": False,
+                        "error": "启用了内置供应商但未选择供应商，请在插件设置中选择一个 LLM 供应商",
+                    }
+                prov = self.context.get_provider_by_id(configured_provider_id)
+                if not prov:
+                    return {
+                        "ok": False,
+                        "error": f"未找到配置的供应商: {configured_provider_id}",
                     }
 
-                except Exception as e:
-                    last_exc = e
-                    attempts += 1
-                    if not use_retry or attempts > max_retries:
-                        return {"ok": False, "error": str(last_exc)}
-                    await asyncio.sleep(retry_delay * attempts)
+                # 从 provider 实例中提取 api_key 和 base_url
+                api_key = prov.get_current_key() if hasattr(prov, 'get_current_key') else ""
+                base_url = prov.provider_config.get("api_base", "")
+                model = prov.meta().model if hasattr(prov.meta(), 'model') else self.config.get("model", "grok-4-fast")
+
+                if not api_key:
+                    return {
+                        "ok": False,
+                        "error": f"无法从供应商 {configured_provider_id} 获取 API Key",
+                    }
+                if not base_url:
+                    return {
+                        "ok": False,
+                        "error": f"无法从供应商 {configured_provider_id} 获取 API Base URL",
+                    }
+
+                logger.info(
+                    f"[{PLUGIN_NAME}] Builtin provider: using {configured_provider_id}, "
+                    f"base_url={base_url}, model={model}"
+                )
+
+                # 获取代理配置
+                proxy = self.config.get("proxy", "").strip() or None
+
+                # 构建额外请求头（继承 provider 的 custom_headers）
+                extra_headers = self._parse_json_config("extra_headers")
+                provider_headers = prov.provider_config.get("custom_headers", {})
+                if provider_headers and isinstance(provider_headers, dict):
+                    if not extra_headers:
+                        extra_headers = {}
+                    for k, v in provider_headers.items():
+                        if k.lower() not in ("authorization", "content-type"):
+                            extra_headers[k] = v
+
+                result = await grok_search(
+                    query=query,
+                    base_url=base_url,
+                    api_key=api_key,
+                    model=model,
+                    timeout=timeout,
+                    enable_thinking=self.config.get("enable_thinking", True),
+                    thinking_budget=thinking_budget,
+                    extra_body=self._parse_json_config("extra_body"),
+                    extra_headers=extra_headers,
+                    session=self._session,
+                    system_prompt=system_prompt,
+                    max_retries=max_retries,
+                    retry_delay=retry_delay,
+                    retryable_status_codes=retryable_status_codes,
+                    images=images,
+                    proxy=proxy,
+                )
+                return result
+
+            except Exception as e:
+                logger.error(f"[{PLUGIN_NAME}] 内置供应商模式调用失败: {e}")
+                return {"ok": False, "error": f"API 调用异常: {e}"}
 
         # 否则使用 HTTP 客户端向外部 Grok API 发起请求
         logger.info(f"[{PLUGIN_NAME}] Using external API, system_prompt type: {type(system_prompt).__name__ if system_prompt else 'None'}")
