@@ -618,6 +618,19 @@ class GrokSearchPlugin(Star):
                 if snippet:
                     lines.append(f"     {snippet}")
 
+        # 附加图片信息：告知 LLM 已发送的图片数量
+        img_count = len(result.get("images", []))
+        tweets_with_imgs = sum(
+            1 for t in result.get("tweets", []) if t.get("images")
+        )
+        if img_count > 0 or tweets_with_imgs > 0:
+            total_imgs = img_count + sum(
+                len(t.get("images", [])) for t in result.get("tweets", [])
+            )
+            lines.append(
+                f"\n[已自动发送 {total_imgs} 张相关图片给用户，请在回复中提及图片已发送]"
+            )
+
         # 提示主 LLM 使用纯文本格式回复用户
         lines.append("\n[提示: 请使用纯文本格式回复用户，不要使用 Markdown 格式]")
 
@@ -1082,6 +1095,37 @@ class GrokSearchPlugin(Star):
             )
 
         result = await self._do_search(query, use_retry=False, images=images or None)
+
+        # 直接发送搜索结果中的图片（不依赖 LLM 转发）
+        enable_images = self.config.get("enable_search_images", True)
+        if enable_images and result.get("ok"):
+            # 从 tweets 中收集图片
+            all_img_urls: list[str] = []
+            for tweet in result.get("tweets", []):
+                for img_url in tweet.get("images", []):
+                    if img_url not in all_img_urls:
+                        all_img_urls.append(img_url)
+            # 也从顶层 images 字段收集
+            for img_url in result.get("images", []):
+                if img_url not in all_img_urls:
+                    all_img_urls.append(img_url)
+
+            max_images = self.config.get("max_search_images", 5)
+            all_img_urls = all_img_urls[:max_images]
+
+            if all_img_urls:
+                logger.info(
+                    f"[{PLUGIN_NAME}] grok_tool: sending {len(all_img_urls)} image(s) directly"
+                )
+                for img_url in all_img_urls:
+                    try:
+                        await event.send(event.image_result(img_url))
+                        await asyncio.sleep(0.3)
+                    except Exception as e:
+                        logger.warning(
+                            f"[{PLUGIN_NAME}] grok_tool: failed to send image {img_url}: {e}"
+                        )
+
         return self._format_result_for_llm(result)
 
     @filter.on_llm_request()
